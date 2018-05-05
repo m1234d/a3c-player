@@ -6,7 +6,10 @@ from scipy.misc import imresize # preserves single-pixel info _unlike_ img = img
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.multiprocessing as mp
+import tensorboardX
+from tensorboardX import SummaryWriter
 os.environ['OMP_NUM_THREADS'] = '1'
+writer = SummaryWriter("./runs")
 
 def get_args():
     parser = argparse.ArgumentParser(description=None)
@@ -27,7 +30,7 @@ discount = lambda x, gamma: lfilter([1],[1,-gamma],x[::-1])[::-1] # discounted r
 prepro = lambda img: imresize(img[35:195].mean(2), (80,80)).astype(np.float32).reshape(1,80,80)/255.
 
 def printlog(args, s, end='\n', mode='a'):
-    print(s, end=end) ; f=open(args.save_dir+'log.txt',mode) ; f.write(s+'\n') ; f.close()
+    print(s, end=end) ; #f=open(args.save_dir+'log.txt',mode) ; f.write(s+'\n') ; f.close()
 
 class NNPolicy(nn.Module): # an actor-critic neural network
     def __init__(self, channels, memsize, num_actions):
@@ -102,7 +105,7 @@ def train(shared_model, shared_optimizer, rank, args, info):
     start_time = last_disp_time = last_disp_time_2 = time.time()
     episode_length, epr, eploss, done  = 0, 0, 0, True # bookkeeping
     measure_counter = 0
-    
+    print(str(rank) + "initialized")
     while info['frames'][0] <= 8e7 or args.test: # openai baselines uses 40M frames...we'll use 80M
         model.load_state_dict(shared_model.state_dict()) # sync with shared model
 
@@ -128,6 +131,11 @@ def train(shared_model, shared_optimizer, rank, args, info):
                 torch.save(shared_model.state_dict(), args.save_dir+'model.{:.0f}.tar'.format(num_frames/1e5))
 
             if done: # update shared data
+                if rank == 0:
+                    writer.add_scalar("rewards/reward_" + str(rank), epr, info['frames'])
+                    writer.add_scalar("losses/loss_" + str(rank), eploss, info['frames'])
+                    time.sleep(1)
+                    printlog(args, "Data written for " + str(rank))
                 info['episodes'] += 1
                 interp = 1 if info['episodes'][0] == 1 else 1 - args.horizon
                 info['run_epr'].mul_(1-interp).add_(interp * epr)
@@ -163,7 +171,6 @@ def train(shared_model, shared_optimizer, rank, args, info):
             for param, shared_param in zip(model.parameters(), shared_model.parameters()):
                 if shared_param.grad is None: shared_param._grad = param.grad # sync gradients with shared model
             shared_optimizer.step()
-
 if __name__ == "__main__":
     if sys.version_info[0] > 2:
         mp.set_start_method('spawn') # this must not be in global scope
@@ -184,9 +191,10 @@ if __name__ == "__main__":
     info = {k: torch.DoubleTensor([0]).share_memory_() for k in ['run_epr', 'run_loss', 'episodes', 'frames']}
     info['frames'] += shared_model.try_load(args.save_dir) * 1e5
     if int(info['frames'].item()) == 0: printlog(args,'', end='', mode='w') # clear log file
-    
+
     processes = []
     for rank in range(args.processes):
         p = mp.Process(target=train, args=(shared_model, shared_optimizer, rank, args, info))
         p.start() ; processes.append(p)
     for p in processes: p.join()
+    writer.close()
