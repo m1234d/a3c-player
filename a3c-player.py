@@ -1,4 +1,5 @@
 from __future__ import print_function
+from retro_contest.local import make
 import torch, os, gym, time, glob, argparse, sys
 import numpy as np
 from scipy.signal import lfilter
@@ -9,12 +10,11 @@ import torch.multiprocessing as mp
 import tensorboardX
 from tensorboardX import SummaryWriter
 os.environ['OMP_NUM_THREADS'] = '1'
-writer = SummaryWriter("./runs")
 
 def get_args():
     parser = argparse.ArgumentParser(description=None)
     parser.add_argument('--env', default='Pong-v4', type=str, help='gym environment')
-    parser.add_argument('--processes', default=8, type=int, help='number of processes to train with')
+    parser.add_argument('--processes', default=mp.cpu_count(), type=int, help='number of processes to train with')
     parser.add_argument('--render', default=False, type=bool, help='renders the atari environment')
     parser.add_argument('--test', default=False, type=bool, help='sets lr=0, chooses most likely actions')
     parser.add_argument('--rnn_steps', default=20, type=int, help='steps to train LSTM over')
@@ -24,7 +24,12 @@ def get_args():
     parser.add_argument('--tau', default=1.0, type=float, help='generalized advantage estimation discount')
     parser.add_argument('--horizon', default=0.99, type=float, help='horizon for running averages')
     parser.add_argument('--hidden', default=256, type=int, help='hidden size of GRU')
+    parser.add_argument('--sonic', default=False, type=bool, help='sonic')
     return parser.parse_args()
+    
+args = get_args()
+args.save_dir = '{}/'.format(args.env.lower()) # keep the directory structure simple
+writer = SummaryWriter("./" + args.save_dir + "/runs")
 
 discount = lambda x, gamma: lfilter([1],[1,-gamma],x[::-1])[::-1] # discounted rewards one liner
 prepro = lambda img: imresize(img[35:195].mean(2), (80,80)).astype(np.float32).reshape(1,80,80)/255.
@@ -97,7 +102,8 @@ def cost_func(args, values, logps, actions, rewards):
     return policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
 
 def train(shared_model, shared_optimizer, rank, args, info):
-    env = gym.make(args.env) # make a local (unshared) environment
+    if args.sonic: env = make(game='SonicTheHedgehog-Genesis', state=args.env)
+    else: env = gym.make(args.env) # make a local (unshared) environment
     env.seed(args.seed + rank) ; torch.manual_seed(args.seed + rank) # seed everything
     model = NNPolicy(channels=1, memsize=args.hidden, num_actions=args.num_actions) # a local/unshared model
     state = torch.tensor(prepro(env.reset())) # get first state
@@ -118,7 +124,12 @@ def train(shared_model, shared_optimizer, rank, args, info):
             logp = F.log_softmax(logit, dim=-1)
 
             action = torch.exp(logp).multinomial(num_samples=1).data[0]#logp.max(1)[1].data if args.test else
-            state, reward, done, _ = env.step(action.numpy()[0])
+            if(args.sonic): 
+                a = action.numpy()[0]
+                b = np.zeros(args.num_actions)
+                b[a] = 1
+                state, reward, done, _ = env.step(b)
+            else:state, reward, done, _ = env.step(action.numpy()[0])
             if args.render: env.render()
 
             state = torch.tensor(prepro(state)) ; epr += reward
@@ -126,16 +137,18 @@ def train(shared_model, shared_optimizer, rank, args, info):
             done = done or episode_length >= 1e4 # don't playing one ep for too long
             
             info['frames'].add_(1) ; num_frames = int(info['frames'].item())
-            if num_frames % 2e5 == 0: # save every 2M frames
+            if num_frames % 1e5 == 0: # save every 2M frames
                 printlog(args, '\n\t{:.0f}M frames: saved model\n'.format(num_frames/1e6))
                 torch.save(shared_model.state_dict(), args.save_dir+'model.{:.0f}.tar'.format(num_frames/1e5))
-
+            
             if done: # update shared data
                 if rank == 0:
                     writer.add_scalar("rewards/reward_" + str(rank), epr, info['frames'])
                     writer.add_scalar("losses/loss_" + str(rank), eploss, info['frames'])
+                    writer.add_scalar("rewards/running_reward", info['run_epr'].item(), info['frames'])
                     time.sleep(1)
                     printlog(args, "Data written for " + str(rank))
+                    printlog(args, "Reward: " + str(epr))
                 info['episodes'] += 1
                 interp = 1 if info['episodes'][0] == 1 else 1 - args.horizon
                 info['run_epr'].mul_(1-interp).add_(interp * epr)
@@ -173,7 +186,7 @@ def train(shared_model, shared_optimizer, rank, args, info):
             shared_optimizer.step()
 if __name__ == "__main__":
     if sys.version_info[0] > 2:
-        mp.set_start_method('spawn') # this must not be in global scope
+        mp.set_start_method('spawn', force=True) # this must not be in global scope
     elif sys.platform == 'linux' or sys.platform == 'linux2':
         raise "Must be using Python 3 with linux!" # or else you get a deadlock in conv2d
     
@@ -181,7 +194,9 @@ if __name__ == "__main__":
     args.save_dir = '{}/'.format(args.env.lower()) # keep the directory structure simple
     if args.render:  args.processes = 1 ; args.test = True # render mode -> test mode w one process
     if args.test:  args.lr = 0 # don't train in render mode
-    args.num_actions = gym.make(args.env).action_space.n # get the action space of this game
+    if args.sonic: args.num_actions = make(game='SonicTheHedgehog-Genesis', state=args.env).action_space.n # get the action space of this game
+    else: args.num_actions = gym.make(args.env).action_space.n 
+    print(args.num_actions)
     os.makedirs(args.save_dir) if not os.path.exists(args.save_dir) else None # make dir to save models etc.
 
     torch.manual_seed(args.seed)
@@ -191,7 +206,6 @@ if __name__ == "__main__":
     info = {k: torch.DoubleTensor([0]).share_memory_() for k in ['run_epr', 'run_loss', 'episodes', 'frames']}
     info['frames'] += shared_model.try_load(args.save_dir) * 1e5
     if int(info['frames'].item()) == 0: printlog(args,'', end='', mode='w') # clear log file
-
     processes = []
     for rank in range(args.processes):
         p = mp.Process(target=train, args=(shared_model, shared_optimizer, rank, args, info))
