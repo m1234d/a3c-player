@@ -8,8 +8,11 @@ python a3c-player.py (args)
 
 args:
 --env (environment name/rom name) (default: pong-v4)
+
 --render (true/false) (default: false) (enable to only use one thread and to watch model play)
+
 --sonic (true/false) (default: false) (enable if using sonic rom)
+
 
 Delete folders with name of environment if you want to restart training.
 Models are saved periodically and added to their respective folders.
