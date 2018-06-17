@@ -7,6 +7,7 @@ Command format:
 python a3c-player.py (args)
 
 args:
+
 --env (environment name/rom name) (default: pong-v4)
 
 --render (true/false) (default: false) (enable to only use one thread and to watch model play)
